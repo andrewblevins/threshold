@@ -94,4 +94,10 @@ def show_prompt():
 
 
 if __name__ == "__main__":
-    show_prompt()
+    import time
+    while True:
+        try:
+            show_prompt()
+            break
+        except Exception:
+            time.sleep(1)
