@@ -6,8 +6,6 @@ A small macOS background app that asks you a single question every time you unlo
 
 You type a one-line answer, press Enter, and get on with your day. The window goes away. Your answer is appended to a local JSONL log so you can read back later what you've been showing up for.
 
-It's meant as a tiny moment of intention at the threshold between away and present.
-
 ---
 
 ## What it actually is
