@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """
 Threshold daemon — long-running process that listens for screen unlock
-and shows the intention prompt instantly, no Python cold-start delay.
+and shows the intention prompt by spawning a short-lived subprocess.
 
 Architecture:
 - A single Python process stays alive, holding the unlock observer.
 - Trigger: com.apple.screenIsUnlocked from the distributed notification
   center (fires on every screen unlock, lid-open-with-lock, etc).
-- On each unlock (or SIGUSR1 for manual trigger), spawn a fresh tk.Tk(),
-  run a short-lived mainloop until the user submits, destroy the window.
-- Per-event tk creation avoids tk-on-macOS issues with hide/show across
-  Spaces and fullscreen toggles.
+- On each unlock (or SIGUSR1 for manual trigger), spawn threshold_prompt.py
+  as a child process. The child runs Tk, blocks until submit, prints the
+  answer to stdout, and exits. The daemon writes the logged entry.
+- Subprocess isolation: Tk on macOS occasionally crashes in
+  TKContentView::resetTkLayerBitmapContext during display-configuration
+  changes (sleep/wake, color profile shifts, monitor changes). Keeping
+  Tk out of the daemon process means those crashes can't take down the
+  unlock observer.
 """
 
 import json
 import signal
+import subprocess
+import sys
 import threading
-import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 
@@ -24,7 +29,9 @@ import objc
 from AppKit import NSObject, NSRunLoop, NSDate
 from Foundation import NSDefaultRunLoopMode, NSDistributedNotificationCenter
 
-LOG_PATH = Path(__file__).parent / "log.jsonl"
+HERE = Path(__file__).parent
+LOG_PATH = HERE / "log.jsonl"
+PROMPT_SCRIPT = HERE / "threshold_prompt.py"
 
 
 def log_entry(answer: str):
@@ -37,70 +44,31 @@ def log_entry(answer: str):
 
 
 def show_prompt():
-    """Build a fresh tk window, run until submit, destroy. Blocking."""
-    root = tk.Tk()
-    root.title("Threshold")
-    root.attributes("-fullscreen", True)
-    root.attributes("-topmost", True)
-    root.configure(bg="#1a1a1a")
-    root.focus_force()
+    """Spawn the Tk prompt subprocess; log whatever answer it returns."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(PROMPT_SCRIPT)],
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        print(f"threshold: failed to spawn prompt: {exc}", file=sys.stderr)
+        return
 
-    frame = tk.Frame(root, bg="#1a1a1a")
-    frame.place(relx=0.5, rely=0.5, anchor="center")
+    if result.returncode != 0:
+        # Non-zero means the user closed without submitting, or the child
+        # crashed. Either way: don't log, don't retry.
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        return
 
-    tk.Label(
-        frame,
-        text="What are you here for?",
-        font=("Georgia", 36),
-        fg="#d4d0c8",
-        bg="#1a1a1a",
-        pady=24,
-    ).pack()
-
-    entry_var = tk.StringVar()
-    entry = tk.Entry(
-        frame,
-        textvariable=entry_var,
-        font=("Georgia", 22),
-        fg="#d4d0c8",
-        bg="#2a2a2a",
-        insertbackground="#d4d0c8",
-        bd=0,
-        highlightthickness=1,
-        highlightcolor="#555",
-        highlightbackground="#333",
-        width=36,
-        justify="center",
-    )
-    entry.pack(ipady=12)
-    entry.focus_set()
-
-    tk.Label(
-        frame,
-        text="press enter to continue",
-        font=("Georgia", 13),
-        fg="#555",
-        bg="#1a1a1a",
-        pady=16,
-    ).pack()
-
-    def submit(event=None):
-        answer = entry_var.get().strip()
-        if not answer:
-            return
+    answer = result.stdout.strip()
+    if answer:
         log_entry(answer)
-        root.destroy()
-
-    entry.bind("<Return>", submit)
-    root.bind("<Escape>", lambda e: None)
-    root.protocol("WM_DELETE_WINDOW", lambda: None)
-
-    root.mainloop()
 
 
-# Coordinate triggers from multiple sources (AppKit wake, SIGUSR1) into a
-# single serialized prompt. tk must run on the main thread, so the AppKit
-# observer and signal handler set a flag; the main loop polls and shows.
+# Coordinate triggers from multiple sources (AppKit unlock, SIGUSR1) into
+# a single serialized prompt. The main loop polls the flag.
 _show_lock = threading.Lock()
 _show_pending = False
 
@@ -149,7 +117,7 @@ def main():
             NSDate.dateWithTimeIntervalSinceNow_(0.2),
         )
         if consume_show_request():
-            show_prompt()  # blocks until submit
+            show_prompt()  # blocks until child exits
 
 
 if __name__ == "__main__":
